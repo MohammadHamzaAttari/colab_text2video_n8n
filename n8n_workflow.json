@@ -2,13 +2,13 @@
   "nodes": [
     {
       "parameters": {},
-      "id": "2da5378b-00ab-404e-959d-680a800be125",
+      "id": "bb1b7051-fb0d-4379-af96-fd77d744bc62",
       "name": "Manual Trigger",
       "type": "n8n-nodes-base.manualTrigger",
       "typeVersion": 1,
       "position": [
-        2080,
-        1360
+        2976,
+        2032
       ]
     },
     {
@@ -16,24 +16,22 @@
         "documentId": {
           "__rl": true,
           "value": "1cI5ebsvBqGF7Gk3NxomDqMVtYsvAQ8BRomtRHiKK2Hc",
-          "mode": "list",
-          "cachedResultName": "al_biruni_prompts"
+          "mode": "list"
         },
         "sheetName": {
           "__rl": true,
           "value": 1667439052,
-          "mode": "list",
-          "cachedResultName": "Prompts"
+          "mode": "list"
         },
         "options": {}
       },
-      "id": "ebe1938c-4d11-4ca1-afcf-dc19cf7e3487",
+      "id": "be19412d-fc53-4920-8a06-4bb6b118f2ac",
       "name": "Read Prompts from Google Sheet",
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4,
       "position": [
-        2304,
-        1360
+        3200,
+        2032
       ],
       "credentials": {
         "googleSheetsOAuth2Api": {
@@ -44,28 +42,28 @@
     },
     {
       "parameters": {
-        "jsCode": "const slug = (v, fb) => String(v || fb)\n  .toLowerCase()\n  .replace(/[^a-z0-9._-]+/g, '-')\n  .replace(/-+/g, '-')\n  .replace(/^[._-]+|[._-]+$/g, '')\n  .slice(0, 80) || fb;\n\nreturn items\n  .filter(item => {\n    const j = item.json;\n    const promptText = String(j['Prompt Text'] || '').trim();\n    if (!promptText || promptText.includes('See original prompt content')) {\n      return false;\n    }\n    const status = String(j.status || '').toLowerCase();\n    return status !== 'done';\n  })\n  .map(item => {\n    const j = item.json;\n    const promptText = String(j['Prompt Text'] || '').trim();\n    const negativePrompt = String(j['Negative Prompts'] || 'static, slow dolly, talking heads, text overlays, modern technology, smartphones, low quality, blurry, distorted, watermark, text, logo');\n    const section = String(j.Section || 'default').trim();\n    const safeFolder = slug(section, 'documentary-series');\n    const promptNum = String(j['Prompt #'] || '').trim();\n    const promptTitle = String(j['Prompt Title'] || '').trim();\n    const safePrefix = slug(\n      (promptNum ? 'prompt-' + promptNum + '-' : '') + promptTitle,\n      'clip'\n    );\n    \n    return {\n      json: {\n        row_number: j.row_number,\n        section: section,\n        prompt_title: promptTitle,\n        prompt: promptText,\n        negative_prompt: negativePrompt,\n        subfolder: safeFolder,\n        filename_prefix: safePrefix,\n        seed: undefined,\n        num_frames: 16,\n        num_inference_steps: 20,\n        guidance_scale: 7.5,\n        width: 256,\n        height: 256,\n        fps: 4\n      }\n    };\n  });"
+        "jsCode": "const slug = (v, fb) => String(v || fb)\n  .toLowerCase()\n  .replace(/[^a-z0-9._-]+/g, '-')\n  .replace(/-+/g, '-')\n  .replace(/^[._-]+|[._-]+$/g, '')\n  .slice(0, 80) || fb;\n\nreturn items\n  .filter(item => {\n    const j = item.json;\n    const promptText = String(j['Prompt Text'] || '').trim();\n    if (!promptText || promptText.includes('See original prompt content')) {\n      return false;\n    }\n    const status = String(j.status || '').toLowerCase();\n    return status !== 'done';\n  })\n  .map(item => {\n    const j = item.json;\n    const promptText = String(j['Prompt Text'] || '').trim();\n    const negativePrompt = String(j['Negative Prompts'] || 'low quality, worst quality, blurry, distorted, watermark, text overlay, logo, bad anatomy, deformed, disfigured, mutation, ugly, static camera, slideshow, jpeg artifacts, compression artifacts');\n    const section = String(j.Section || 'default').trim();\n    const safeFolder = slug(section, 'documentary-series');\n    const promptNum = String(j['Prompt #'] || '').trim();\n    const promptTitle = String(j['Prompt Title'] || '').trim();\n    const safePrefix = slug(\n      (promptNum ? 'prompt-' + promptNum + '-' : '') + promptTitle,\n      'clip'\n    );\n    \n    return {\n      json: {\n        row_number: j.row_number,\n        section: section,\n        prompt_title: promptTitle,\n        prompt: promptText,\n        negative_prompt: negativePrompt,\n        subfolder: safeFolder,\n        filename_prefix: safePrefix,\n        seed: undefined,\n        num_frames: 24,\n        num_inference_steps: 40,\n        guidance_scale: 17.5,\n        width: 576,\n        height: 320,\n        fps: 8\n      }\n    };\n  });"
       },
-      "id": "bc9ca299-53d3-4799-abb7-085424e19252",
+      "id": "050e3a2b-917c-4cb2-8fd1-7364b3ddde0d",
       "name": "Prepare Rows",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        2528,
-        1360
+        3424,
+        2032
       ]
     },
     {
       "parameters": {
         "options": {}
       },
-      "id": "a6083a7f-ebf6-4aa2-88a6-af9fc117d0a5",
+      "id": "814c0af2-6af6-4045-b7fd-0c958598e6a9",
       "name": "Split In Batches",
       "type": "n8n-nodes-base.splitInBatches",
       "typeVersion": 3,
       "position": [
-        2752,
-        1360
+        3648,
+        2032
       ]
     },
     {
@@ -79,41 +77,41 @@
           "timeout": 30000
         }
       },
-      "id": "8b8882f0-fbc0-4c26-b6e4-b425d9dde6d6",
-      "name": "Start Generation (Async)",
+      "id": "49f771cf-7ce8-4d20-9e01-81c01b2c3645",
+      "name": "Start Generation",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        2960,
-        1360
+        3856,
+        2032
       ]
     },
     {
       "parameters": {
-        "jsCode": "// Store both job_id AND original request data\nreturn items.map(item => ({\n  json: {\n    job_id: item.json.job_id,\n    status: item.json.status || 'queued',\n    original_data: $('Prepare Rows').item.json,\n    poll_count: 0\n  }\n}));"
+        "jsCode": "return items.map(item => ({\n  json: {\n    job_id: item.json.job_id,\n    status: item.json.status || 'queued',\n    original_data: $('Prepare Rows').item.json,\n    poll_count: 0\n  }\n}));"
       },
-      "id": "3658fc85-b84c-451d-bc02-1d7043542b39",
-      "name": "Initialize Polling Data",
+      "id": "879363f5-0cc6-48ec-bc96-e35861468768",
+      "name": "Initialize Polling",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3136,
-        1360
+        4032,
+        2032
       ]
     },
     {
       "parameters": {
-        "amount": 15
+        "amount": 20
       },
-      "id": "15a22d09-6266-4543-b026-fff5aabe5385",
-      "name": "Wait 15 Seconds",
+      "id": "cf040a35-8b3e-40b2-9c76-e9fc008dd147",
+      "name": "Wait 20 Seconds",
       "type": "n8n-nodes-base.wait",
       "typeVersion": 1.1,
       "position": [
-        3312,
-        1360
+        4208,
+        2032
       ],
-      "webhookId": "wait-poll-webhook"
+      "webhookId": "wait-webhook"
     },
     {
       "parameters": {
@@ -122,26 +120,26 @@
           "timeout": 30000
         }
       },
-      "id": "2a63d1c8-9897-489d-b9b3-f60cf7038668",
+      "id": "bce22b49-3c66-43a6-9d34-37faaf8b8675",
       "name": "Poll Job Status",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
-        3488,
-        1360
+        4384,
+        2032
       ]
     },
     {
       "parameters": {
-        "jsCode": "// CRITICAL: Merge polling response WITH preserved job_id and original_data\nreturn items.map(item => {\n  // Get the polling response (current item)\n  const pollingResponse = item.json;\n  \n  // Get the data from the previous node that has job_id preserved\n  const previousData = $('Wait 15 Seconds').item.json;\n  \n  return {\n    json: {\n      // Preserve job_id and original_data from loop\n      job_id: previousData.job_id,\n      original_data: previousData.original_data,\n      poll_count: (previousData.poll_count || 0) + 1,\n      \n      // Add current status from API response\n      status: pollingResponse.status,\n      video_url: pollingResponse.video_url,\n      file_name: pollingResponse.file_name,\n      file_path: pollingResponse.file_path,\n      error: pollingResponse.error\n    }\n  };\n});"
+        "jsCode": "return items.map(item => {\n  const pollingResponse = item.json;\n  const previousData = $('Wait 20 Seconds').item.json;\n  \n  return {\n    json: {\n      job_id: previousData.job_id,\n      original_data: previousData.original_data,\n      poll_count: (previousData.poll_count || 0) + 1,\n      status: pollingResponse.status,\n      video_url: pollingResponse.video_url,\n      file_name: pollingResponse.file_name,\n      file_path: pollingResponse.file_path,\n      seed: pollingResponse.seed,\n      generation_time: pollingResponse.generation_time,\n      error: pollingResponse.error\n    }\n  };\n});"
       },
-      "id": "d03be3b5-1b49-4bf4-aa08-0bd4298f7168",
+      "id": "73dd29a4-2a36-4662-be2d-1fe12c1806dd",
       "name": "Merge Poll Response",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        3664,
-        1360
+        4560,
+        2032
       ]
     },
     {
@@ -155,39 +153,39 @@
           ]
         }
       },
-      "id": "3fe1d172-e9bc-4a7e-ac03-3cc5cded9ed6",
+      "id": "a9a41963-6a5d-4c43-b1cf-cb88d852cfb9",
       "name": "Check If Completed",
       "type": "n8n-nodes-base.if",
       "typeVersion": 1,
       "position": [
-        3840,
-        1360
+        4736,
+        2032
       ]
     },
     {
       "parameters": {
-        "jsCode": "return items.map(item => {\n  const r = item.json;\n  const prepareData = r.original_data;\n  \n  if (r.status !== 'completed' || !r.video_url) {\n    throw new Error('Generation failed: ' + JSON.stringify(r));\n  }\n  \n  const file = String(r.file_name || (r.job_id + '.mp4'))\n    .replace(/[^a-zA-Z0-9._-]/g, '_');\n  const folder = String(prepareData.subfolder || 'documentary-series')\n    .replace(/[^a-zA-Z0-9._-]/g, '-');\n  const localPath = `$HOME/video/${folder}/${file}`;\n  \n  return {\n    json: {\n      ...prepareData,\n      job_id: r.job_id,\n      video_url: r.video_url,\n      safe_file: file,\n      safe_folder: folder,\n      local_path: localPath\n    }\n  };\n});"
+        "jsCode": "return items.map(item => {\n  const r = item.json;\n  const prepareData = r.original_data;\n  \n  if (r.status !== 'completed' || !r.video_url) {\n    throw new Error('Generation failed: ' + JSON.stringify(r));\n  }\n  \n  const file = String(r.file_name || (r.job_id + '.mp4'))\n    .replace(/[^a-zA-Z0-9._-]/g, '_');\n  const folder = String(prepareData.subfolder || 'documentary-series')\n    .replace(/[^a-zA-Z0-9._-]/g, '-');\n  const localPath = `$HOME/video/${folder}/${file}`;\n  \n  return {\n    json: {\n      ...prepareData,\n      job_id: r.job_id,\n      video_url: r.video_url,\n      safe_file: file,\n      safe_folder: folder,\n      local_path: localPath,\n      seed: r.seed,\n      generation_time: r.generation_time\n    }\n  };\n});"
       },
-      "id": "68d5760f-8bde-4db0-a113-245f553f557a",
+      "id": "a5b6281f-0f25-4116-a4cf-2bddc3756a17",
       "name": "Prepare Download",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        4000,
-        1248
+        4896,
+        1920
       ]
     },
     {
       "parameters": {
-        "command": "={{ 'mkdir -p \"$HOME/video/' + $json.safe_folder + '\" && curl -L --fail --retry 3 \"' + $json.video_url + '\" -o \"$HOME/video/' + $json.safe_folder + '/' + $json.safe_file + '\" && echo \"Saved: $HOME/video/' + $json.safe_folder + '/' + $json.safe_file + '\"' }}"
+        "command": "={{ 'mkdir -p \"$HOME/video/' + $json.safe_folder + '\" && curl -L --fail --retry 3 \"' + $json.video_url + '\" -o \"$HOME/video/' + $json.safe_folder + '/' + $json.safe_file + '\" && echo \"✅ Saved: $HOME/video/' + $json.safe_folder + '/' + $json.safe_file + ' (seed: ' + $json.seed + ', time: ' + $json.generation_time + 's)\"' }}"
       },
-      "id": "437e2c0e-57bd-4c11-b1ec-2acb3af3ee79",
+      "id": "c22b38f6-03f5-4b54-9e67-647a6f98fcd0",
       "name": "SSH Save Video",
       "type": "n8n-nodes-base.ssh",
       "typeVersion": 1,
       "position": [
-        4176,
-        1248
+        5072,
+        1920
       ],
       "credentials": {
         "sshPassword": {
@@ -198,15 +196,15 @@
     },
     {
       "parameters": {
-        "jsCode": "return items.map(item => {\n  const base = $('Prepare Download').item.json;\n  return {\n    json: {\n      row_number: base.row_number,\n      status: 'done',\n      video_url: base.video_url,\n      local_path: base.local_path,\n      file_name: base.safe_file\n    }\n  };\n});"
+        "jsCode": "return items.map(item => {\n  const base = $('Prepare Download').item.json;\n  return {\n    json: {\n      row_number: base.row_number,\n      status: 'done',\n      video_url: base.video_url,\n      local_path: base.local_path,\n      file_name: base.safe_file,\n      seed: base.seed,\n      generation_time: base.generation_time\n    }\n  };\n});"
       },
-      "id": "83b8f60a-b4fb-4323-909a-219d2c4991ed",
+      "id": "a6bd3bb1-802a-48aa-9bb7-1c76c86afb3c",
       "name": "Prepare Sheet Update",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        4352,
-        1248
+        5248,
+        1920
       ]
     },
     {
@@ -223,98 +221,26 @@
           "mode": "list"
         },
         "columns": {
-          "mappingMode": "autoMapInputData",
+          "mappingMode": "defineBelow",
           "value": {
-            "row_number": 0
+            "status": "={{ $json.status }}",
+            "video_url": "={{ $json.video_url }}",
+            "local_path": "={{ $json.local_path }}",
+            "file_name": "={{ $json.file_name }}"
           },
           "matchingColumns": [
             "row_number"
-          ],
-          "schema": [
-            {
-              "id": "Section",
-              "displayName": "Section",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true,
-              "removed": false
-            },
-            {
-              "id": "Prompt #",
-              "displayName": "Prompt #",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true,
-              "removed": false
-            },
-            {
-              "id": "Prompt Title",
-              "displayName": "Prompt Title",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true,
-              "removed": false
-            },
-            {
-              "id": "Prompt Text",
-              "displayName": "Prompt Text",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true,
-              "removed": false
-            },
-            {
-              "id": "Technical Settings",
-              "displayName": "Technical Settings",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true,
-              "removed": false
-            },
-            {
-              "id": "Negative Prompts",
-              "displayName": "Negative Prompts",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "string",
-              "canBeUsedToMatch": true,
-              "removed": false
-            },
-            {
-              "id": "row_number",
-              "displayName": "row_number",
-              "required": false,
-              "defaultMatch": false,
-              "display": true,
-              "type": "number",
-              "canBeUsedToMatch": true,
-              "readOnly": true,
-              "removed": false
-            }
-          ],
-          "attemptToConvertTypes": false,
-          "convertFieldsToString": false
+          ]
         },
         "options": {}
       },
-      "id": "f53f5a38-b0a1-49a4-9af9-362b90083056",
+      "id": "2d5df080-997b-4201-bfbe-539496fcd704",
       "name": "Update Sheet Status",
       "type": "n8n-nodes-base.googleSheets",
       "typeVersion": 4,
       "position": [
-        4528,
-        1248
+        5424,
+        1920
       ],
       "credentials": {
         "googleSheetsOAuth2Api": {
@@ -363,36 +289,36 @@
         [],
         [
           {
-            "node": "Start Generation (Async)",
+            "node": "Start Generation",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Start Generation (Async)": {
+    "Start Generation": {
       "main": [
         [
           {
-            "node": "Initialize Polling Data",
+            "node": "Initialize Polling",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Initialize Polling Data": {
+    "Initialize Polling": {
       "main": [
         [
           {
-            "node": "Wait 15 Seconds",
+            "node": "Wait 20 Seconds",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Wait 15 Seconds": {
+    "Wait 20 Seconds": {
       "main": [
         [
           {
@@ -436,7 +362,7 @@
         ],
         [
           {
-            "node": "Wait 15 Seconds",
+            "node": "Wait 20 Seconds",
             "type": "main",
             "index": 0
           }
