@@ -1,26 +1,29 @@
-# Paste/run this in a Google Colab cell after uploading/cloning this repo.
-# It installs dependencies, starts the API, and creates a public Cloudflare tunnel URL.
+# Paste/run this in a Google Colab cell
+# PRODUCTION SETUP FOR YOUTUBE QUALITY
 
 import os, re, subprocess, textwrap, time
 from pathlib import Path
 
-# Optional: change the model before starting.
-os.environ.setdefault("MODEL_ID", "damo-vilab/text-to-video-ms-1.7b")
+# IMPORTANT: Use ZeroScope v2 for 16:9 ratio and better quality
+os.environ.setdefault("MODEL_ID", "cerspense/zeroscope_v2_576w")
 os.environ.setdefault("OUTPUT_DIR", "/content/generated_videos")
 
-# Install Python dependencies.
+print("📦 Installing dependencies...")
 subprocess.run("pip -q install -r requirements_colab.txt", shell=True, check=True)
 
-# Install cloudflared for a public HTTPS URL without an account.
+# Install cloudflared
 if not Path("/usr/local/bin/cloudflared").exists():
+    print("🔧 Installing Cloudflare tunnel...")
     subprocess.run("wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared", shell=True, check=True)
     subprocess.run("chmod +x /usr/local/bin/cloudflared", shell=True, check=True)
 
-# Start FastAPI locally.
+# Start FastAPI
+print("🚀 Starting FastAPI server...")
 api = subprocess.Popen("uvicorn app:app --host 0.0.0.0 --port 8000", shell=True)
 time.sleep(8)
 
-# Start Cloudflare quick tunnel and capture public URL.
+# Start Cloudflare tunnel
+print("🌐 Creating public tunnel...")
 tunnel = subprocess.Popen(
     "cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate",
     shell=True,
@@ -43,12 +46,19 @@ if not public_url:
     raise RuntimeError("Cloudflare tunnel URL not found. Re-run this cell.")
 
 os.environ["PUBLIC_BASE_URL"] = public_url
-print("\n✅ Colab Text-to-Video API is live")
-print("Base URL:", public_url)
-print("Generation endpoint:", public_url + "/generate_sync")
-print("Health endpoint:", public_url + "/health")
-print("\nKeep this Colab cell running while n8n sends requests.")
 
-# Keep cell alive and stream logs.
+print("\n" + "="*70)
+print("✅ PRODUCTION TEXT-TO-VIDEO API IS LIVE")
+print("="*70)
+print(f"📡 Base URL: {public_url}")
+print(f"🎬 Generate endpoint: {public_url}/generate")
+print(f"💚 Health check: {public_url}/health")
+print(f"🎥 Model: {os.environ['MODEL_ID']}")
+print(f"📐 Max resolution: 576×320 (16:9 aspect ratio)")
+print(f"⚡ Recommended: 24 frames, 40 steps, guidance 17.5")
+print("="*70)
+print("\n⚠️  Keep this Colab tab open while n8n generates videos\n")
+
+# Keep alive
 while True:
     time.sleep(60)

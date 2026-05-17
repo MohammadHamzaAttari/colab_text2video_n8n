@@ -1,0 +1,1099 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+app.py
+colab_setup_and_run.py
+Colab_Text_To_Video_API.ipynb
+google_sheet_template.csv
+n8n_workflow.json
+README.md
+requirements_colab.txt
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="app.py">
+"""
+Colab Text-to-Video API for n8n
+Default model: damo-vilab/text-to-video-ms-1.7b
+Run in Google Colab with a GPU runtime.
+"""
+import os
+import re
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
+
+import torch
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
+from diffusers.utils import export_to_video
+
+# -------- Config --------
+MODEL_ID = os.environ.get("MODEL_ID", "damo-vilab/text-to-video-ms-1.7b")
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/content/generated_videos"))
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+app = FastAPI(title="Colab Text-to-Video API", version="1.0.0")
+app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
+
+pipe = None
+jobs = {}
+
+
+def slugify(value: str, fallback: str = "video") -> str:
+    value = (value or "").strip().lower()
+    value = re.sub(r"[^a-z0-9._-]+", "-", value)
+    value = re.sub(r"-+", "-", value).strip("-._")
+    return value[:80] or fallback
+
+
+class GenerateRequest(BaseModel):
+    prompt: str = Field(..., min_length=3, description="Text prompt for video generation")
+    negative_prompt: str = "low quality, blurry, distorted, watermark, text, logo, bad anatomy"
+    seed: Optional[int] = Field(None, description="Optional deterministic seed")
+    num_frames: int = Field(16, ge=8, le=32)
+    num_inference_steps: int = Field(25, ge=5, le=60)
+    guidance_scale: float = Field(9.0, ge=1.0, le=20.0)
+    height: int = Field(256, ge=128, le=576)
+    width: int = Field(256, ge=128, le=1024)
+    fps: int = Field(8, ge=4, le=24)
+    subfolder: str = Field("documentary_series", description="Folder under generated_videos")
+    filename_prefix: str = Field("clip", description="Output filename prefix")
+
+
+class GenerateResponse(BaseModel):
+    job_id: str
+    status: str
+    file_name: Optional[str] = None
+    file_path: Optional[str] = None
+    video_url: Optional[str] = None
+    error: Optional[str] = None
+
+
+def get_base_url(request: Request) -> str:
+    """Return the public URL seen by n8n through Cloudflare/ngrok/reverse proxy."""
+    env_url = os.environ.get("PUBLIC_BASE_URL")
+    if env_url:
+        return env_url.rstrip("/")
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or "127.0.0.1:8000"
+    proto = request.headers.get("x-forwarded-proto")
+    if not proto:
+        proto = "https" if "trycloudflare.com" in host or "ngrok" in host else request.url.scheme
+    return f"{proto}://{host}".rstrip("/")
+
+
+def get_pipeline():
+    global pipe
+    if pipe is not None:
+        return pipe
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("No CUDA GPU found. In Colab select Runtime > Change runtime type > T4 GPU.")
+
+    dtype = torch.float16
+    pipe = DiffusionPipeline.from_pretrained(
+        MODEL_ID,
+        torch_dtype=dtype,
+        variant="fp16" if MODEL_ID == "damo-vilab/text-to-video-ms-1.7b" else None,
+    )
+    # Better scheduler + lower VRAM settings
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe.enable_model_cpu_offload()
+    pipe.enable_vae_slicing()
+    try:
+        pipe.enable_xformers_memory_efficient_attention()
+    except Exception:
+        pass
+    return pipe
+
+
+def generate_video(req: GenerateRequest, base_url: str, job_id: Optional[str] = None):
+    job_id = job_id or str(uuid.uuid4())
+    jobs[job_id] = {"status": "running", "created_at": time.time(), "prompt": req.prompt}
+    try:
+        p = get_pipeline()
+        generator = None
+        seed = req.seed if req.seed is not None else int(time.time()) % 2_147_483_647
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+
+        folder = OUTPUT_DIR / slugify(req.subfolder, "documentary_series")
+        folder.mkdir(parents=True, exist_ok=True)
+        file_name = f"{slugify(req.filename_prefix, 'clip')}-{job_id[:8]}-seed{seed}.mp4"
+        out_path = folder / file_name
+
+        with torch.inference_mode():
+            result = p(
+                prompt=req.prompt,
+                negative_prompt=req.negative_prompt,
+                num_frames=req.num_frames,
+                num_inference_steps=req.num_inference_steps,
+                guidance_scale=req.guidance_scale,
+                height=req.height,
+                width=req.width,
+                generator=generator,
+            )
+        frames = result.frames[0]
+        export_to_video(frames, str(out_path), fps=req.fps)
+
+        rel = out_path.relative_to(OUTPUT_DIR).as_posix()
+        video_url = f"{base_url.rstrip('/')}/files/{rel}"
+        jobs[job_id] = {
+            "status": "completed",
+            "created_at": jobs[job_id]["created_at"],
+            "prompt": req.prompt,
+            "seed": seed,
+            "file_name": file_name,
+            "file_path": str(out_path),
+            "video_url": video_url,
+        }
+    except Exception as e:
+        jobs[job_id] = {
+            "status": "failed",
+            "created_at": jobs.get(job_id, {}).get("created_at", time.time()),
+            "prompt": req.prompt,
+            "error": repr(e),
+        }
+    return jobs[job_id]
+
+
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "model": MODEL_ID,
+        "endpoints": {
+            "sync_generation": "POST /generate_sync",
+            "async_generation": "POST /generate",
+            "job_status": "GET /jobs/{job_id}",
+            "files": "GET /files/{subfolder}/{filename}.mp4",
+        },
+    }
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "cuda": torch.cuda.is_available(), "model_loaded": pipe is not None}
+
+
+@app.post("/generate_sync", response_model=GenerateResponse)
+def generate_sync(req: GenerateRequest, request: Request):
+    """Generate video and wait until finished. Easiest endpoint for n8n."""
+    base_url = get_base_url(request)
+    job_id = str(uuid.uuid4())
+    data = generate_video(req, base_url=base_url, job_id=job_id)
+    return GenerateResponse(job_id=job_id, **data)
+
+
+@app.post("/generate", response_model=GenerateResponse)
+def generate_async(req: GenerateRequest, request: Request, background_tasks: BackgroundTasks):
+    """Start generation in background. Use GET /jobs/{job_id} to poll."""
+    base_url = get_base_url(request)
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "queued", "created_at": time.time(), "prompt": req.prompt}
+    background_tasks.add_task(generate_video, req, base_url, job_id)
+    return GenerateResponse(job_id=job_id, status="queued")
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return jobs[job_id]
+
+
+@app.get("/download/{subfolder}/{filename}")
+def download(subfolder: str, filename: str):
+    path = OUTPUT_DIR / slugify(subfolder) / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(str(path), media_type="video/mp4", filename=filename)
+</file>
+
+<file path="colab_setup_and_run.py">
+# Paste/run this in a Google Colab cell after uploading/cloning this repo.
+# It installs dependencies, starts the API, and creates a public Cloudflare tunnel URL.
+
+import os, re, subprocess, textwrap, time
+from pathlib import Path
+
+# Optional: change the model before starting.
+os.environ.setdefault("MODEL_ID", "damo-vilab/text-to-video-ms-1.7b")
+os.environ.setdefault("OUTPUT_DIR", "/content/generated_videos")
+
+# Install Python dependencies.
+subprocess.run("pip -q install -r requirements_colab.txt", shell=True, check=True)
+
+# Install cloudflared for a public HTTPS URL without an account.
+if not Path("/usr/local/bin/cloudflared").exists():
+    subprocess.run("wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared", shell=True, check=True)
+    subprocess.run("chmod +x /usr/local/bin/cloudflared", shell=True, check=True)
+
+# Start FastAPI locally.
+api = subprocess.Popen("uvicorn app:app --host 0.0.0.0 --port 8000", shell=True)
+time.sleep(8)
+
+# Start Cloudflare quick tunnel and capture public URL.
+tunnel = subprocess.Popen(
+    "cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate",
+    shell=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
+)
+
+public_url = None
+for _ in range(80):
+    line = tunnel.stdout.readline()
+    print(line, end="")
+    m = re.search(r"https://[-a-zA-Z0-9.]+trycloudflare.com", line)
+    if m:
+        public_url = m.group(0)
+        break
+    time.sleep(1)
+
+if not public_url:
+    raise RuntimeError("Cloudflare tunnel URL not found. Re-run this cell.")
+
+os.environ["PUBLIC_BASE_URL"] = public_url
+print("\n✅ Colab Text-to-Video API is live")
+print("Base URL:", public_url)
+print("Generation endpoint:", public_url + "/generate_sync")
+print("Health endpoint:", public_url + "/health")
+print("\nKeep this Colab cell running while n8n sends requests.")
+
+# Keep cell alive and stream logs.
+while True:
+    time.sleep(60)
+</file>
+
+<file path="Colab_Text_To_Video_API.ipynb">
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {},
+      "source": [
+        "# Colab Text-to-Video API for n8n\n",
+        "Run this notebook on a GPU runtime. It exposes `/generate_sync` for n8n.\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "!nvidia-smi\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "# If using GitHub:\n",
+        "# !git clone YOUR_REPOSITORY_URL colab_text2video_n8n\n",
+        "# %cd colab_text2video_n8n\n",
+        "\n",
+        "# If you uploaded the files directly, make sure you are in the folder containing app.py.\n",
+        "!ls\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {},
+      "outputs": [],
+      "source": [
+        "exec(open('colab_setup_and_run.py').read())\n"
+      ]
+    }
+  ],
+  "metadata": {
+    "accelerator": "GPU",
+    "kernelspec": {
+      "display_name": "Python 3",
+      "language": "python",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python",
+      "version": "3.x"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 5
+}
+</file>
+
+<file path="google_sheet_template.csv">
+row_id,prompt,negative_prompt,subfolder,filename_prefix,seed,num_frames,steps,guidance_scale,width,height,fps,status,video_url,local_path
+1,"cinematic documentary b-roll of ancient ruins at sunrise, slow drone movement, realistic, natural colors","cartoon, animation, text, watermark, low quality",episode-01,ancient-ruins,12345,16,25,9,256,256,8,,,
+</file>
+
+<file path="n8n_workflow.json">
+{
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "2da5378b-00ab-404e-959d-680a800be125",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        2080,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1cI5ebsvBqGF7Gk3NxomDqMVtYsvAQ8BRomtRHiKK2Hc",
+          "mode": "list",
+          "cachedResultName": "al_biruni_prompts"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1667439052,
+          "mode": "list",
+          "cachedResultName": "Prompts"
+        },
+        "options": {}
+      },
+      "id": "ebe1938c-4d11-4ca1-afcf-dc19cf7e3487",
+      "name": "Read Prompts from Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        2304,
+        1360
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "8OsKTqcQI3Rry1Uu",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const slug = (v, fb) => String(v || fb)\n  .toLowerCase()\n  .replace(/[^a-z0-9._-]+/g, '-')\n  .replace(/-+/g, '-')\n  .replace(/^[._-]+|[._-]+$/g, '')\n  .slice(0, 80) || fb;\n\nreturn items\n  .filter(item => {\n    const j = item.json;\n    const promptText = String(j['Prompt Text'] || '').trim();\n    if (!promptText || promptText.includes('See original prompt content')) {\n      return false;\n    }\n    const status = String(j.status || '').toLowerCase();\n    return status !== 'done';\n  })\n  .map(item => {\n    const j = item.json;\n    const promptText = String(j['Prompt Text'] || '').trim();\n    const negativePrompt = String(j['Negative Prompts'] || 'static, slow dolly, talking heads, text overlays, modern technology, smartphones, low quality, blurry, distorted, watermark, text, logo');\n    const section = String(j.Section || 'default').trim();\n    const safeFolder = slug(section, 'documentary-series');\n    const promptNum = String(j['Prompt #'] || '').trim();\n    const promptTitle = String(j['Prompt Title'] || '').trim();\n    const safePrefix = slug(\n      (promptNum ? 'prompt-' + promptNum + '-' : '') + promptTitle,\n      'clip'\n    );\n    \n    return {\n      json: {\n        row_number: j.row_number,\n        section: section,\n        prompt_title: promptTitle,\n        prompt: promptText,\n        negative_prompt: negativePrompt,\n        subfolder: safeFolder,\n        filename_prefix: safePrefix,\n        seed: undefined,\n        num_frames: 16,\n        num_inference_steps: 20,\n        guidance_scale: 7.5,\n        width: 256,\n        height: 256,\n        fps: 4\n      }\n    };\n  });"
+      },
+      "id": "bc9ca299-53d3-4799-abb7-085424e19252",
+      "name": "Prepare Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2528,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "a6083a7f-ebf6-4aa2-88a6-af9fc117d0a5",
+      "name": "Split In Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2752,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://mail-licence-amp-occurrence.trycloudflare.com/generate",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  prompt: $json.prompt,\n  negative_prompt: $json.negative_prompt,\n  seed: $json.seed,\n  num_frames: $json.num_frames,\n  num_inference_steps: $json.num_inference_steps,\n  guidance_scale: $json.guidance_scale,\n  width: $json.width,\n  height: $json.height,\n  fps: $json.fps,\n  subfolder: $json.subfolder,\n  filename_prefix: $json.filename_prefix\n}) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "8b8882f0-fbc0-4c26-b6e4-b425d9dde6d6",
+      "name": "Start Generation (Async)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2960,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Store both job_id AND original request data\nreturn items.map(item => ({\n  json: {\n    job_id: item.json.job_id,\n    status: item.json.status || 'queued',\n    original_data: $('Prepare Rows').item.json,\n    poll_count: 0\n  }\n}));"
+      },
+      "id": "3658fc85-b84c-451d-bc02-1d7043542b39",
+      "name": "Initialize Polling Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3136,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 15
+      },
+      "id": "15a22d09-6266-4543-b026-fff5aabe5385",
+      "name": "Wait 15 Seconds",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3312,
+        1360
+      ],
+      "webhookId": "wait-poll-webhook"
+    },
+    {
+      "parameters": {
+        "url": "=https://mail-licence-amp-occurrence.trycloudflare.com/jobs/{{ $json.job_id }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "2a63d1c8-9897-489d-b9b3-f60cf7038668",
+      "name": "Poll Job Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3488,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// CRITICAL: Merge polling response WITH preserved job_id and original_data\nreturn items.map(item => {\n  // Get the polling response (current item)\n  const pollingResponse = item.json;\n  \n  // Get the data from the previous node that has job_id preserved\n  const previousData = $('Wait 15 Seconds').item.json;\n  \n  return {\n    json: {\n      // Preserve job_id and original_data from loop\n      job_id: previousData.job_id,\n      original_data: previousData.original_data,\n      poll_count: (previousData.poll_count || 0) + 1,\n      \n      // Add current status from API response\n      status: pollingResponse.status,\n      video_url: pollingResponse.video_url,\n      file_name: pollingResponse.file_name,\n      file_path: pollingResponse.file_path,\n      error: pollingResponse.error\n    }\n  };\n});"
+      },
+      "id": "d03be3b5-1b49-4bf4-aa08-0bd4298f7168",
+      "name": "Merge Poll Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3664,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.status }}",
+              "value2": "completed"
+            }
+          ]
+        }
+      },
+      "id": "3fe1d172-e9bc-4a7e-ac03-3cc5cded9ed6",
+      "name": "Check If Completed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        3840,
+        1360
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(item => {\n  const r = item.json;\n  const prepareData = r.original_data;\n  \n  if (r.status !== 'completed' || !r.video_url) {\n    throw new Error('Generation failed: ' + JSON.stringify(r));\n  }\n  \n  const file = String(r.file_name || (r.job_id + '.mp4'))\n    .replace(/[^a-zA-Z0-9._-]/g, '_');\n  const folder = String(prepareData.subfolder || 'documentary-series')\n    .replace(/[^a-zA-Z0-9._-]/g, '-');\n  const localPath = `$HOME/video/${folder}/${file}`;\n  \n  return {\n    json: {\n      ...prepareData,\n      job_id: r.job_id,\n      video_url: r.video_url,\n      safe_file: file,\n      safe_folder: folder,\n      local_path: localPath\n    }\n  };\n});"
+      },
+      "id": "68d5760f-8bde-4db0-a113-245f553f557a",
+      "name": "Prepare Download",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4000,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ 'mkdir -p \"$HOME/video/' + $json.safe_folder + '\" && curl -L --fail --retry 3 \"' + $json.video_url + '\" -o \"$HOME/video/' + $json.safe_folder + '/' + $json.safe_file + '\" && echo \"Saved: $HOME/video/' + $json.safe_folder + '/' + $json.safe_file + '\"' }}"
+      },
+      "id": "437e2c0e-57bd-4c11-b1ec-2acb3af3ee79",
+      "name": "SSH Save Video",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        4176,
+        1248
+      ],
+      "credentials": {
+        "sshPassword": {
+          "id": "agD4kJPh6DmOckRr",
+          "name": "SSH Password account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(item => {\n  const base = $('Prepare Download').item.json;\n  return {\n    json: {\n      row_number: base.row_number,\n      status: 'done',\n      video_url: base.video_url,\n      local_path: base.local_path,\n      file_name: base.safe_file\n    }\n  };\n});"
+      },
+      "id": "83b8f60a-b4fb-4323-909a-219d2c4991ed",
+      "name": "Prepare Sheet Update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4352,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "1cI5ebsvBqGF7Gk3NxomDqMVtYsvAQ8BRomtRHiKK2Hc",
+          "mode": "list"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1667439052,
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {
+            "row_number": 0
+          },
+          "matchingColumns": [
+            "row_number"
+          ],
+          "schema": [
+            {
+              "id": "Section",
+              "displayName": "Section",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Prompt #",
+              "displayName": "Prompt #",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Prompt Title",
+              "displayName": "Prompt Title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Prompt Text",
+              "displayName": "Prompt Text",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Technical Settings",
+              "displayName": "Technical Settings",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "Negative Prompts",
+              "displayName": "Negative Prompts",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "f53f5a38-b0a1-49a4-9af9-362b90083056",
+      "name": "Update Sheet Status",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        4528,
+        1248
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "8OsKTqcQI3Rry1Uu",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Prompts from Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Prompts from Google Sheet": {
+      "main": [
+        [
+          {
+            "node": "Prepare Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Rows": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split In Batches": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Start Generation (Async)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start Generation (Async)": {
+      "main": [
+        [
+          {
+            "node": "Initialize Polling Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initialize Polling Data": {
+      "main": [
+        [
+          {
+            "node": "Wait 15 Seconds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 15 Seconds": {
+      "main": [
+        [
+          {
+            "node": "Poll Job Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll Job Status": {
+      "main": [
+        [
+          {
+            "node": "Merge Poll Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Poll Response": {
+      "main": [
+        [
+          {
+            "node": "Check If Completed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check If Completed": {
+      "main": [
+        [
+          {
+            "node": "Prepare Download",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait 15 Seconds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Download": {
+      "main": [
+        [
+          {
+            "node": "SSH Save Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SSH Save Video": {
+      "main": [
+        [
+          {
+            "node": "Prepare Sheet Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Sheet Update": {
+      "main": [
+        [
+          {
+            "node": "Update Sheet Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Sheet Status": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "b4b3888f2b16b749440ab4ac4a27b5996372013c2346e260c8154399f21c628e"
+  }
+}
+</file>
+
+<file path="README.md">
+# Colab Text-to-Video API + n8n Google Sheets Workflow
+
+This repository gives you a lightweight Google Colab setup that exposes a text-to-video model through an HTTP API, plus an n8n workflow that reads prompts from Google Sheets and saves generated MP4 files on your local disk under `~/video/<subfolder>/` using n8n's SSH node.
+
+## 1) Model used
+
+Default model:
+
+```text
+damo-vilab/text-to-video-ms-1.7b
+```
+
+It is one of the more practical open text-to-video models for Colab T4 when you keep outputs small, for example `256x256`, `16` frames, and `20-30` steps.
+
+You can change it in Colab:
+
+```python
+import os
+os.environ["MODEL_ID"] = "damo-vilab/text-to-video-ms-1.7b"
+```
+
+## 2) Files
+
+- `app.py` - FastAPI text-to-video server.
+- `requirements_colab.txt` - Colab Python dependencies.
+- `colab_setup_and_run.py` - code to run inside Google Colab.
+- `n8n_workflow.json` - importable n8n workflow template.
+- `google_sheet_template.csv` - sample Google Sheet columns.
+
+## 3) Run on Google Colab
+
+Create a new Colab notebook with GPU enabled:
+
+`Runtime > Change runtime type > T4 GPU`
+
+Then run:
+
+```bash
+!git clone YOUR_REPOSITORY_URL colab_text2video_n8n
+%cd colab_text2video_n8n
+```
+
+If you upload these files manually instead of using GitHub, just place them in the Colab working directory and run:
+
+```python
+exec(open("colab_setup_and_run.py").read())
+```
+
+The cell will print something like:
+
+```text
+Base URL: https://example-random.trycloudflare.com
+Generation endpoint: https://example-random.trycloudflare.com/generate_sync
+Health endpoint: https://example-random.trycloudflare.com/health
+```
+
+Keep the Colab cell running while n8n is generating videos.
+
+## 4) API endpoint
+
+### Health
+
+```http
+GET https://YOUR-COLAB-TUNNEL.trycloudflare.com/health
+```
+
+### Generate video synchronously
+
+```http
+POST https://YOUR-COLAB-TUNNEL.trycloudflare.com/generate_sync
+Content-Type: application/json
+```
+
+Body:
+
+```json
+{
+  "prompt": "cinematic documentary b-roll of ancient ruins at sunrise, realistic, slow drone movement",
+  "negative_prompt": "cartoon, text, watermark, low quality",
+  "seed": 12345,
+  "num_frames": 16,
+  "num_inference_steps": 25,
+  "guidance_scale": 9,
+  "width": 256,
+  "height": 256,
+  "fps": 8,
+  "subfolder": "episode-01",
+  "filename_prefix": "ancient-ruins"
+}
+```
+
+Response:
+
+```json
+{
+  "job_id": "...",
+  "status": "completed",
+  "file_name": "ancient-ruins-abc12345-seed12345.mp4",
+  "file_path": "/content/generated_videos/episode-01/ancient-ruins-abc12345-seed12345.mp4",
+  "video_url": "https://YOUR-COLAB-TUNNEL.trycloudflare.com/files/episode-01/ancient-ruins-abc12345-seed12345.mp4"
+}
+```
+
+## 5) Google Sheet setup
+
+Create a Google Sheet with these headers:
+
+```csv
+row_id,prompt,negative_prompt,subfolder,filename_prefix,seed,num_frames,steps,guidance_scale,width,height,fps,status,video_url,local_path
+```
+
+You can import `google_sheet_template.csv`.
+
+Recommended generation settings for Colab T4:
+
+- `width`: `256`
+- `height`: `256`
+- `num_frames`: `16`
+- `steps`: `20` to `30`
+- `fps`: `8`
+
+## 6) n8n setup on local system
+
+Your n8n is running locally at:
+
+```text
+http://localhost:5678
+```
+
+### Required credentials
+
+1. **Google Sheets OAuth2 credential** in n8n.
+2. **SSH credential** pointing to your local machine.
+
+For the SSH node to save files locally, your local machine must accept SSH connections.
+
+Linux example:
+
+```bash
+sudo apt update
+sudo apt install openssh-server curl -y
+sudo systemctl enable --now ssh
+ssh localhost
+```
+
+macOS:
+
+```text
+System Settings > General > Sharing > Remote Login > On
+```
+
+Windows:
+
+Install and enable OpenSSH Server, then test:
+
+```powershell
+ssh localhost
+```
+
+The workflow saves files to:
+
+```text
+$HOME/video/<subfolder>/<generated-file>.mp4
+```
+
+## 7) Import n8n workflow
+
+1. Open `http://localhost:5678`.
+2. Import `n8n_workflow.json`.
+3. Replace placeholders:
+   - `PUT_GOOGLE_SHEET_ID_HERE`
+   - Google Sheets credential ID/name
+   - SSH credential ID/name
+   - `PASTE_COLAB_PUBLIC_URL_HERE/generate_sync`
+4. Or set the n8n environment variable:
+
+```bash
+COLAB_T2V_URL=https://YOUR-COLAB-TUNNEL.trycloudflare.com/generate_sync
+```
+
+5. Run the workflow manually first.
+
+## 8) What the workflow does
+
+1. Reads rows from Google Sheets.
+2. Filters rows where `prompt` exists and `status` is not `done`.
+3. Sends each prompt to Colab endpoint `/generate_sync`.
+4. Receives `video_url` from Colab.
+5. Runs SSH command on your local machine:
+
+```bash
+mkdir -p "$HOME/video/<subfolder>" && curl -L --fail --retry 3 "<video_url>" -o "$HOME/video/<subfolder>/<filename>.mp4"
+```
+
+6. Updates the Google Sheet status.
+
+## 9) Notes
+
+- Free Colab sessions disconnect; keep the tab active while generating.
+- The Cloudflare quick tunnel URL changes every time you restart the Colab cell.
+- For longer/higher-resolution documentary clips, generate multiple short b-roll clips and edit/upscale later.
+- If generation fails with CUDA out-of-memory, reduce `width`, `height`, `num_frames`, or `steps`.
+</file>
+
+<file path="requirements_colab.txt">
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+python-multipart==0.0.20
+accelerate==1.2.1
+diffusers==0.31.0
+transformers==4.47.1
+safetensors==0.4.5
+imageio==2.36.1
+imageio-ffmpeg==0.5.1
+huggingface_hub==0.27.0
+nest-asyncio==1.6.0
+</file>
+
+</files>
