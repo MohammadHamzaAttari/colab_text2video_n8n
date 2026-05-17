@@ -1,0 +1,2 @@
+row_id,prompt,negative_prompt,subfolder,filename_prefix,seed,num_frames,steps,guidance_scale,width,height,fps,status,video_url,local_path
+1,"cinematic documentary b-roll of ancient ruins at sunrise, slow drone movement, realistic, natural colors","cartoon, animation, text, watermark, low quality",episode-01,ancient-ruins,12345,16,25,9,256,256,8,,,

@@ -1,0 +1,264 @@
+{
+  "name": "Google Sheets to Colab Text-to-Video to Local Folder",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "manual-trigger",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -860,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": "PUT_GOOGLE_SHEET_ID_HERE",
+        "sheetName": "Sheet1",
+        "options": {}
+      },
+      "id": "read-google-sheet",
+      "name": "Read Prompts from Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        -640,
+        120
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PUT_YOUR_N8N_GOOGLE_CREDENTIAL_ID_HERE",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return items\n  .filter(item => item.json.prompt && String(item.json.status || '').toLowerCase() !== 'done')\n  .map(item => {\n    const j = item.json;\n    const slug = (v, fb) => String(v || fb).toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/-+/g, '-').replace(/^[._-]+|[._-]+$/g, '').slice(0, 80) || fb;\n    const safeFolder = slug(j.subfolder, 'documentary-series');\n    const safePrefix = slug(j.filename_prefix, 'clip');\n    return { json: {\n      row_id: j.row_id,\n      prompt: j.prompt,\n      negative_prompt: j.negative_prompt || 'low quality, blurry, distorted, watermark, text, logo',\n      subfolder: safeFolder,\n      filename_prefix: safePrefix,\n      seed: j.seed ? Number(j.seed) : undefined,\n      num_frames: j.num_frames ? Number(j.num_frames) : 16,\n      num_inference_steps: j.steps ? Number(j.steps) : 25,\n      guidance_scale: j.guidance_scale ? Number(j.guidance_scale) : 9,\n      width: j.width ? Number(j.width) : 256,\n      height: j.height ? Number(j.height) : 256,\n      fps: j.fps ? Number(j.fps) : 8\n    }};\n  });"
+      },
+      "id": "prepare-rows",
+      "name": "Prepare Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -420,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "split-in-batches",
+      "name": "Split In Batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        -200,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.COLAB_T2V_URL || 'PASTE_COLAB_PUBLIC_URL_HERE/generate_sync'}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ prompt: $json.prompt, negative_prompt: $json.negative_prompt, seed: $json.seed, num_frames: $json.num_frames, num_inference_steps: $json.num_inference_steps, guidance_scale: $json.guidance_scale, width: $json.width, height: $json.height, fps: $json.fps, subfolder: $json.subfolder, filename_prefix: $json.filename_prefix }) }}",
+        "options": {
+          "timeout": 900000
+        }
+      },
+      "id": "send-to-colab",
+      "name": "Send Prompt to Colab API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        20,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(item => {\n  const r = item.json;\n  if (r.status !== 'completed' || !r.video_url) throw new Error('Colab generation failed: ' + JSON.stringify(r));\n  const file = String(r.file_name || (r.job_id + '.mp4')).replace(/[^a-zA-Z0-9._-]/g, '_');\n  const folder = String($('Prepare Rows').item.json.subfolder || 'documentary-series').replace(/[^a-zA-Z0-9._-]/g, '-');\n  const localPath = `$HOME/video/${folder}/${file}`;\n  return { json: { ...$('Prepare Rows').item.json, ...r, safe_file: file, safe_folder: folder, local_path: localPath } };\n});"
+      },
+      "id": "prepare-download",
+      "name": "Prepare Local Download Command",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "command": "={{ 'mkdir -p \"$HOME/video/' + $json.safe_folder + '\" && curl -L --fail --retry 3 ' + JSON.stringify($json.video_url) + ' -o \"$HOME/video/' + $json.safe_folder + '/' + $json.safe_file + '\" && echo \"Saved: $HOME/video/' + $json.safe_folder + '/' + $json.safe_file + '\"' }}"
+      },
+      "id": "ssh-save-local",
+      "name": "SSH Save Video to Local Disk",
+      "type": "n8n-nodes-base.ssh",
+      "typeVersion": 1,
+      "position": [
+        460,
+        120
+      ],
+      "credentials": {
+        "sshPassword": {
+          "id": "PUT_YOUR_N8N_SSH_CREDENTIAL_ID_HERE",
+          "name": "Localhost SSH"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return items.map(item => {\n  const base = $('Prepare Local Download Command').item.json;\n  return { json: {\n    row_id: base.row_id,\n    status: 'done',\n    video_url: base.video_url,\n    local_path: base.local_path,\n    prompt: base.prompt,\n    subfolder: base.safe_folder,\n    filename_prefix: base.filename_prefix\n  }};\n});"
+      },
+      "id": "prepare-sheet-update",
+      "name": "Prepare Sheet Update",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        650,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": "PUT_GOOGLE_SHEET_ID_HERE",
+        "sheetName": "Sheet1",
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {}
+        },
+        "options": {}
+      },
+      "id": "update-google-sheet",
+      "name": "Update Sheet Status",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [
+        880,
+        120
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "PUT_YOUR_N8N_GOOGLE_CREDENTIAL_ID_HERE",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Prompts from Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Prompts from Google Sheet": {
+      "main": [
+        [
+          {
+            "node": "Prepare Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Rows": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split In Batches": {
+      "main": [
+        [
+          {
+            "node": "Send Prompt to Colab API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Prompt to Colab API": {
+      "main": [
+        [
+          {
+            "node": "Prepare Local Download Command",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Local Download Command": {
+      "main": [
+        [
+          {
+            "node": "SSH Save Video to Local Disk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SSH Save Video to Local Disk": {
+      "main": [
+        [
+          {
+            "node": "Prepare Sheet Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Sheet Status": {
+      "main": [
+        [
+          {
+            "node": "Split In Batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Sheet Update": {
+      "main": [
+        [
+          {
+            "node": "Update Sheet Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionTimeout": 3600
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 0,
+  "updatedAt": "2026-05-17T00:00:00.000Z",
+  "versionId": "1"
+}
