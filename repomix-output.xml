@@ -44,7 +44,6 @@ app.py
 colab_setup_and_run.py
 Colab_Text_To_Video_API.ipynb
 google_sheet_template.csv
-n8n_workflow.json
 README.md
 requirements_colab.txt
 </directory_structure>
@@ -328,21 +327,32 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
 python-multipart==0.0.20
-accelerate==1.2.1
-diffusers==0.31.0
-transformers==4.47.1
+accelerate==1.3.0
+diffusers==0.32.2
+transformers==4.48.0
 safetensors==0.4.5
 imageio==2.36.1
 imageio-ffmpeg==0.5.1
-huggingface_hub==0.27.0
+huggingface_hub==0.27.1
 nest-asyncio==1.6.0
+sentencepiece==0.2.0
+protobuf==5.29.3
+torch==2.5.1
+torchvision==0.20.1
+xformers==0.0.28.post3
+bitsandbytes==0.45.0
+pyngrok==7.2.3
+requests==2.32.3
 </file>
 
 <file path="app.py">
 """
-Colab Text-to-Video API for n8n - PRODUCTION QUALITY
-Supports multiple models optimized for YouTube automation
+Colab Text-to-Video API - LTX-Video Edition
+Best quality open-source model for Google Colab T4 GPU
+Model: Lightricks/LTX-Video (LTXV-13B-0.9.7-distilled)
 """
+import gc
+import logging
 import os
 import re
 import time
@@ -351,26 +361,44 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
-from diffusers.utils import export_to_video
 
-# -------- Config --------
-# Use ZeroScope for better quality (supports 16:9 aspect ratio)
-MODEL_ID = os.environ.get("MODEL_ID", "cerspense/zeroscope_v2_576w")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
+
+# ─────────────────────────── Config ───────────────────────────
+# LTX-Video: best quality model that fits on T4
+# Distilled variant = fewer steps needed (4-8 steps vs 50)
+MODEL_ID = os.environ.get(
+    "MODEL_ID",
+    "Lightricks/LTX-Video",
+)
+
+# Distilled checkpoint - faster + quality boost
+CKPT_ID = os.environ.get(
+    "CKPT_ID",
+    "Lightricks/LTXV-13B-0.9.7-distilled",
+)
+
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/content/generated_videos"))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Colab Text-to-Video API", version="2.0.0")
+MAX_JOBS_HISTORY = 100  # keep last N jobs in memory
+
+app = FastAPI(title="LTX-Video Documentary API", version="3.0.0")
 app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
 
-pipe = None
-jobs = {}
+_pipe = None
+_jobs: dict[str, dict] = {}
 
 
+# ─────────────────────────── Helpers ──────────────────────────
 def slugify(value: str, fallback: str = "video") -> str:
     value = (value or "").strip().lower()
     value = re.sub(r"[^a-z0-9._-]+", "-", value)
@@ -378,18 +406,104 @@ def slugify(value: str, fallback: str = "video") -> str:
     return value[:80] or fallback
 
 
+def free_memory():
+    """Aggressively free GPU memory between generations."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+
+def get_vram_gb() -> float:
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_properties(0).total_memory / 1e9
+    return 0.0
+
+
+def get_base_url(request: Request) -> str:
+    env_url = os.environ.get("PUBLIC_BASE_URL")
+    if env_url:
+        return env_url.rstrip("/")
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or "127.0.0.1:8000"
+    )
+    proto = request.headers.get("x-forwarded-proto")
+    if not proto:
+        proto = (
+            "https"
+            if "trycloudflare.com" in host or "ngrok" in host
+            else request.url.scheme
+        )
+    return f"{proto}://{host}".rstrip("/")
+
+
+# ─────────────────────────── Schema ───────────────────────────
 class GenerateRequest(BaseModel):
-    prompt: str = Field(..., min_length=3, description="Text prompt for video generation")
-    negative_prompt: str = "low quality, blurry, distorted, watermark, text, logo, bad anatomy, worst quality, low resolution"
-    seed: Optional[int] = Field(None, description="Optional deterministic seed")
-    num_frames: int = Field(24, ge=8, le=32)
-    num_inference_steps: int = Field(40, ge=10, le=100)
-    guidance_scale: float = Field(17.5, ge=1.0, le=30.0)
-    height: int = Field(320, ge=128, le=576)
-    width: int = Field(576, ge=128, le=1024)
-    fps: int = Field(8, ge=4, le=30)
-    subfolder: str = Field("documentary_series", description="Folder under generated_videos")
-    filename_prefix: str = Field("clip", description="Output filename prefix")
+    prompt: str = Field(
+        ...,
+        min_length=3,
+        description="Detailed text prompt. More detail = better video.",
+    )
+    negative_prompt: str = Field(
+        default=(
+            "worst quality, inconsistent motion, blurry, jittery, distorted, "
+            "watermark, text, logo, low resolution, static, overexposed, "
+            "underexposed, duplicate frames, flickering"
+        ),
+    )
+    seed: Optional[int] = Field(None, description="Reproducible seed")
+
+    # LTX-Video distilled works great with 4-8 steps
+    # Full model needs 40-50 steps
+    num_frames: int = Field(
+        default=97,
+        ge=9,
+        le=257,
+        description="Must be N*8+1 (e.g. 9,17,25,49,97,121,161,257)",
+    )
+    num_inference_steps: int = Field(
+        default=6,
+        ge=4,
+        le=50,
+        description="4-8 for distilled model. 40-50 for full model.",
+    )
+    guidance_scale: float = Field(
+        default=1.0,
+        ge=1.0,
+        le=10.0,
+        description="1.0 for distilled. 3.5-7.0 for full model.",
+    )
+    # LTX-Video native resolution - must be divisible by 32
+    height: int = Field(
+        default=480,
+        ge=256,
+        le=720,
+        description="Must be divisible by 32. Max 720 on T4.",
+    )
+    width: int = Field(
+        default=704,
+        ge=256,
+        le=1280,
+        description="Must be divisible by 32. Max 1280 on T4.",
+    )
+    fps: int = Field(default=24, ge=8, le=30)
+
+    subfolder: str = Field(
+        default="documentary",
+        description="Subdirectory under generated_videos/",
+    )
+    filename_prefix: str = Field(
+        default="clip",
+        description="Filename prefix for the output MP4.",
+    )
+
+    # LTX-Video specific enhancement
+    enhance_prompt: bool = Field(
+        default=True,
+        description="Use built-in prompt enhancer for better results.",
+    )
 
 
 class GenerateResponse(BaseModel):
@@ -401,158 +515,444 @@ class GenerateResponse(BaseModel):
     error: Optional[str] = None
     seed: Optional[int] = None
     generation_time: Optional[float] = None
+    vram_used_gb: Optional[float] = None
 
 
-def get_base_url(request: Request) -> str:
-    """Return the public URL seen by n8n through Cloudflare/ngrok/reverse proxy."""
-    env_url = os.environ.get("PUBLIC_BASE_URL")
-    if env_url:
-        return env_url.rstrip("/")
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or "127.0.0.1:8000"
-    proto = request.headers.get("x-forwarded-proto")
-    if not proto:
-        proto = "https" if "trycloudflare.com" in host or "ngrok" in host else request.url.scheme
-    return f"{proto}://{host}".rstrip("/")
-
-
+# ─────────────────────────── Pipeline ─────────────────────────
 def get_pipeline():
-    global pipe
-    if pipe is not None:
-        return pipe
+    """
+    Load LTX-Video pipeline with T4-optimised settings.
+    Auto-detects distilled vs full checkpoint.
+    """
+    global _pipe
+    if _pipe is not None:
+        return _pipe
 
     if not torch.cuda.is_available():
-        raise RuntimeError("No CUDA GPU found. In Colab select Runtime > Change runtime type > T4 GPU.")
+        raise RuntimeError(
+            "No CUDA GPU detected. "
+            "In Colab: Runtime > Change runtime type > T4 GPU"
+        )
 
-    dtype = torch.float16
-    
-    # Load model with optimizations
-    pipe = DiffusionPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=dtype,
+    vram = get_vram_gb()
+    log.info("GPU VRAM: %.1f GB", vram)
+
+    from diffusers import LTXPipeline, LTXVideoTransformer3DModel
+    from transformers import T5EncoderModel
+
+    log.info("Loading LTX-Video model: %s", MODEL_ID)
+    log.info("Checkpoint: %s", CKPT_ID)
+
+    is_distilled = "distilled" in CKPT_ID.lower()
+
+    # Load transformer from distilled checkpoint for quality boost
+    if is_distilled:
+        log.info("Using distilled transformer checkpoint...")
+        transformer = LTXVideoTransformer3DModel.from_pretrained(
+            CKPT_ID,
+            subfolder="transformer",
+            torch_dtype=torch.bfloat16,
+        )
+    else:
+        transformer = None
+
+    # Load text encoder in 8-bit to save ~4GB VRAM
+    log.info("Loading T5 text encoder (quantised)...")
+    try:
+        text_encoder = T5EncoderModel.from_pretrained(
+            MODEL_ID,
+            subfolder="text_encoder",
+            torch_dtype=torch.bfloat16,
+            load_in_8bit=True,
+            device_map="auto",
+        )
+        log.info("T5 loaded in 8-bit mode - saved ~4GB VRAM")
+    except Exception as e:
+        log.warning("8-bit load failed (%s), loading in bfloat16...", e)
+        text_encoder = T5EncoderModel.from_pretrained(
+            MODEL_ID,
+            subfolder="text_encoder",
+            torch_dtype=torch.bfloat16,
+        )
+
+    # Assemble pipeline
+    pipe_kwargs = dict(
+        torch_dtype=torch.bfloat16,
+        text_encoder=text_encoder,
     )
-    
-    # Better scheduler for quality
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
-    
-    # Memory optimizations
-    pipe.enable_model_cpu_offload()
-    pipe.enable_vae_slicing()
-    
+    if transformer is not None:
+        pipe_kwargs["transformer"] = transformer
+
+    _pipe = LTXPipeline.from_pretrained(MODEL_ID, **pipe_kwargs)
+
+    # ── Memory optimisations (order matters) ──────────────────
+    # 1. CPU offload - moves model parts to CPU when not in use
+    _pipe.enable_model_cpu_offload()
+
+    # 2. VAE tiling - process video in tiles to save VRAM
+    _pipe.vae.enable_tiling()
+
+    # 3. VAE slicing - process batch slices sequentially
+    _pipe.vae.enable_slicing()
+
+    # 4. Attention slicing - chunk attention computation
     try:
-        pipe.enable_xformers_memory_efficient_attention()
+        _pipe.enable_attention_slicing(1)
     except Exception:
         pass
-    
-    # Additional quality boost
+
+    # 5. xFormers memory efficient attention
     try:
-        pipe.enable_attention_slicing(1)
+        _pipe.enable_xformers_memory_efficient_attention()
+        log.info("xFormers enabled")
     except Exception:
-        pass
-    
-    return pipe
+        log.info("xFormers not available, using PyTorch SDPA")
+
+    log.info("LTX-Video pipeline ready!")
+    log.info("VRAM after load: %.1f GB used", torch.cuda.memory_allocated() / 1e9)
+    return _pipe
 
 
-def generate_video(req: GenerateRequest, base_url: str, job_id: Optional[str] = None):
+def _round_to_valid_frames(n: int) -> int:
+    """
+    LTX-Video requires num_frames = N*8 + 1.
+    Round to nearest valid value.
+    """
+    valid = [9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97,
+             105, 113, 121, 129, 137, 145, 153, 161, 169, 177,
+             185, 193, 201, 209, 217, 225, 233, 241, 249, 257]
+    return min(valid, key=lambda x: abs(x - n))
+
+
+def _round_to_32(n: int) -> int:
+    """LTX-Video requires height/width divisible by 32."""
+    return max(32, (n // 32) * 32)
+
+
+# ─────────────────────────── Generation ───────────────────────
+def generate_video(
+    req: GenerateRequest,
+    base_url: str,
+    job_id: Optional[str] = None,
+) -> dict:
     job_id = job_id or str(uuid.uuid4())
     start_time = time.time()
-    jobs[job_id] = {"status": "running", "created_at": start_time, "prompt": req.prompt}
-    
+
+    _jobs[job_id] = {
+        "status": "running",
+        "created_at": start_time,
+        "prompt": req.prompt,
+    }
+
     try:
         p = get_pipeline()
-        seed = req.seed if req.seed is not None else int(time.time()) % 2_147_483_647
-        generator = torch.Generator(device="cuda").manual_seed(seed)
 
-        folder = OUTPUT_DIR / slugify(req.subfolder, "documentary_series")
+        # ── Validate / normalise params ───────────────────────
+        seed = (
+            req.seed
+            if req.seed is not None
+            else int(time.time()) % 2_147_483_647
+        )
+        num_frames = _round_to_valid_frames(req.num_frames)
+        height = _round_to_32(req.height)
+        width = _round_to_32(req.width)
+
+        if num_frames != req.num_frames:
+            log.info("num_frames adjusted %d → %d", req.num_frames, num_frames)
+        if height != req.height or width != req.width:
+            log.info("Resolution adjusted to %dx%d", width, height)
+
+        # ── Output path ───────────────────────────────────────
+        folder = OUTPUT_DIR / slugify(req.subfolder, "documentary")
         folder.mkdir(parents=True, exist_ok=True)
-        file_name = f"{slugify(req.filename_prefix, 'clip')}-{job_id[:8]}-seed{seed}.mp4"
+        file_name = (
+            f"{slugify(req.filename_prefix, 'clip')}"
+            f"-{job_id[:8]}-seed{seed}.mp4"
+        )
         out_path = folder / file_name
 
-        # Generate with quality settings
+        # ── Prompt enhancement ────────────────────────────────
+        prompt = req.prompt
+        if req.enhance_prompt:
+            # Append cinematic quality tags for documentary style
+            cinematic_tags = (
+                ", cinematic, photorealistic, 8K, high detail, "
+                "natural lighting, documentary style, realistic motion, "
+                "sharp focus, professional cinematography"
+            )
+            if not any(t in prompt.lower() for t in ["cinematic", "photorealistic", "8k"]):
+                prompt = prompt + cinematic_tags
+                log.info("Prompt enhanced with cinematic tags")
+
+        log.info(
+            "Generating: frames=%d steps=%d guidance=%.1f res=%dx%d seed=%d",
+            num_frames,
+            req.num_inference_steps,
+            req.guidance_scale,
+            width,
+            height,
+            seed,
+        )
+
+        # ── Run inference ─────────────────────────────────────
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        free_memory()
+
+        vram_before = torch.cuda.memory_allocated() / 1e9
+
         with torch.inference_mode():
             result = p(
-                prompt=req.prompt,
+                prompt=prompt,
                 negative_prompt=req.negative_prompt,
-                num_frames=req.num_frames,
+                num_frames=num_frames,
                 num_inference_steps=req.num_inference_steps,
                 guidance_scale=req.guidance_scale,
-                height=req.height,
-                width=req.width,
+                height=height,
+                width=width,
                 generator=generator,
             )
-        
-        frames = result.frames[0]
-        
-        # Export with higher quality settings
-        export_to_video(frames, str(out_path), fps=req.fps)
 
+        vram_peak = torch.cuda.max_memory_allocated() / 1e9
+
+        # ── Export video ──────────────────────────────────────
+        # LTX-Video returns frames as list of PIL images
+        frames = result.frames[0]
+
+        # Use imageio for high-quality H.264 export
+        _export_video_hq(frames, str(out_path), fps=req.fps)
+
+        free_memory()
         generation_time = time.time() - start_time
+
         rel = out_path.relative_to(OUTPUT_DIR).as_posix()
         video_url = f"{base_url.rstrip('/')}/files/{rel}"
-        
-        jobs[job_id] = {
+
+        log.info(
+            "Done in %.1fs | VRAM peak: %.1fGB | %s",
+            generation_time,
+            vram_peak,
+            file_name,
+        )
+
+        result_data = {
             "status": "completed",
-            "created_at": jobs[job_id]["created_at"],
+            "created_at": start_time,
             "prompt": req.prompt,
             "seed": seed,
             "file_name": file_name,
             "file_path": str(out_path),
             "video_url": video_url,
             "generation_time": round(generation_time, 2),
+            "vram_used_gb": round(vram_peak, 2),
         }
-    except Exception as e:
-        jobs[job_id] = {
+        _jobs[job_id] = result_data
+
+        # Prune old jobs
+        if len(_jobs) > MAX_JOBS_HISTORY:
+            oldest = sorted(_jobs, key=lambda k: _jobs[k].get("created_at", 0))
+            for old_key in oldest[: len(_jobs) - MAX_JOBS_HISTORY]:
+                _jobs.pop(old_key, None)
+
+        return result_data
+
+    except torch.cuda.OutOfMemoryError:
+        free_memory()
+        msg = (
+            "CUDA out of memory. "
+            "Reduce width/height/num_frames and retry. "
+            f"Try: width=512, height=288, num_frames=49"
+        )
+        log.error(msg)
+        _jobs[job_id] = {
             "status": "failed",
-            "created_at": jobs.get(job_id, {}).get("created_at", time.time()),
+            "created_at": _jobs.get(job_id, {}).get("created_at", time.time()),
             "prompt": req.prompt,
-            "error": repr(e),
+            "error": msg,
         }
-    
-    return jobs[job_id]
+        return _jobs[job_id]
+
+    except Exception as exc:
+        free_memory()
+        log.exception("Generation failed")
+        _jobs[job_id] = {
+            "status": "failed",
+            "created_at": _jobs.get(job_id, {}).get("created_at", time.time()),
+            "prompt": req.prompt,
+            "error": repr(exc),
+        }
+        return _jobs[job_id]
 
 
+def _export_video_hq(frames, path: str, fps: int = 24):
+    """
+    Export frames to H.264 MP4 with high quality settings.
+    Falls back gracefully if ffmpeg options not supported.
+    """
+    import imageio
+    import numpy as np
+
+    # Convert PIL images to numpy arrays
+    np_frames = []
+    for f in frames:
+        if hasattr(f, "numpy"):
+            arr = f.numpy()
+        else:
+            arr = np.array(f)
+        # Ensure uint8
+        if arr.dtype != np.uint8:
+            arr = (arr * 255).clip(0, 255).astype(np.uint8)
+        np_frames.append(arr)
+
+    try:
+        # High quality H.264 with good bitrate for documentary
+        writer = imageio.get_writer(
+            path,
+            fps=fps,
+            codec="libx264",
+            quality=None,
+            output_params=[
+                "-crf", "18",          # Near-lossless (0=lossless, 51=worst)
+                "-preset", "slow",     # Better compression
+                "-pix_fmt", "yuv420p", # Wide compatibility
+                "-movflags", "+faststart",  # Web-optimized
+            ],
+        )
+        for frame in np_frames:
+            writer.append_data(frame)
+        writer.close()
+        log.info("Exported %d frames to %s (HQ H.264)", len(np_frames), path)
+
+    except Exception as e:
+        log.warning("HQ export failed (%s), using standard export...", e)
+        # Fallback to standard export
+        writer = imageio.get_writer(path, fps=fps, quality=8)
+        for frame in np_frames:
+            writer.append_data(frame)
+        writer.close()
+
+
+# ─────────────────────────── Routes ───────────────────────────
 @app.get("/")
 def root():
+    vram = get_vram_gb()
+    loaded = _pipe is not None
     return {
         "ok": True,
         "model": MODEL_ID,
+        "checkpoint": CKPT_ID,
+        "gpu_vram_gb": round(vram, 1),
+        "model_loaded": loaded,
+        "recommended_settings": {
+            "distilled_model": {
+                "num_frames": 97,
+                "num_inference_steps": 6,
+                "guidance_scale": 1.0,
+                "width": 704,
+                "height": 480,
+                "fps": 24,
+                "note": "Fast generation, excellent quality",
+            },
+            "memory_safe": {
+                "num_frames": 49,
+                "num_inference_steps": 6,
+                "guidance_scale": 1.0,
+                "width": 512,
+                "height": 288,
+                "fps": 24,
+                "note": "Use if OOM errors occur",
+            },
+        },
         "endpoints": {
-            "sync_generation": "POST /generate_sync",
-            "async_generation": "POST /generate",
-            "job_status": "GET /jobs/{job_id}",
+            "sync": "POST /generate_sync",
+            "async": "POST /generate",
+            "status": "GET /jobs/{job_id}",
             "files": "GET /files/{subfolder}/{filename}.mp4",
+            "health": "GET /health",
         },
     }
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "cuda": torch.cuda.is_available(), "model_loaded": pipe is not None, "model": MODEL_ID}
+    vram_total = get_vram_gb()
+    vram_used = (
+        torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
+    )
+    return {
+        "ok": True,
+        "cuda": torch.cuda.is_available(),
+        "vram_total_gb": round(vram_total, 1),
+        "vram_used_gb": round(vram_used, 2),
+        "vram_free_gb": round(vram_total - vram_used, 2),
+        "model_loaded": _pipe is not None,
+        "model": MODEL_ID,
+        "checkpoint": CKPT_ID,
+        "jobs_tracked": len(_jobs),
+    }
 
 
 @app.post("/generate_sync", response_model=GenerateResponse)
 def generate_sync(req: GenerateRequest, request: Request):
-    """Generate video and wait until finished. Easiest endpoint for n8n."""
+    """
+    Synchronous generation - blocks until video is ready.
+    Best for n8n simple HTTP request nodes.
+    Timeout: set n8n HTTP node timeout to 600000ms (10 min).
+    """
     base_url = get_base_url(request)
     job_id = str(uuid.uuid4())
     data = generate_video(req, base_url=base_url, job_id=job_id)
-    return GenerateResponse(job_id=job_id, **data)
+    return GenerateResponse(job_id=job_id, **{
+        k: v for k, v in data.items()
+        if k in GenerateResponse.model_fields
+    })
 
 
 @app.post("/generate", response_model=GenerateResponse)
-def generate_async(req: GenerateRequest, request: Request, background_tasks: BackgroundTasks):
-    """Start generation in background. Use GET /jobs/{job_id} to poll."""
+def generate_async(
+    req: GenerateRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Async generation - returns immediately with job_id.
+    Poll GET /jobs/{job_id} every 20-30 seconds.
+    """
     base_url = get_base_url(request)
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "queued", "created_at": time.time(), "prompt": req.prompt}
+    _jobs[job_id] = {
+        "status": "queued",
+        "created_at": time.time(),
+        "prompt": req.prompt,
+    }
     background_tasks.add_task(generate_video, req, base_url, job_id)
     return GenerateResponse(job_id=job_id, status="queued")
 
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
-    if job_id not in jobs:
+    if job_id not in _jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+    return _jobs[job_id]
+
+
+@app.get("/jobs")
+def list_jobs():
+    """List all tracked jobs with their status."""
+    return {
+        "total": len(_jobs),
+        "jobs": {
+            jid: {
+                "status": j.get("status"),
+                "created_at": j.get("created_at"),
+                "generation_time": j.get("generation_time"),
+            }
+            for jid, j in sorted(
+                _jobs.items(),
+                key=lambda x: x[1].get("created_at", 0),
+                reverse=True,
+            )[:20]
+        },
+    }
 
 
 @app.get("/download/{subfolder}/{filename}")
@@ -561,535 +961,311 @@ def download(subfolder: str, filename: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(str(path), media_type="video/mp4", filename=filename)
+
+
+@app.post("/warmup")
+def warmup(request: Request):
+    """
+    Pre-load the model into VRAM.
+    Call this once after startup to avoid cold-start on first generation.
+    """
+    try:
+        get_pipeline()
+        return {
+            "ok": True,
+            "model_loaded": True,
+            "vram_used_gb": round(
+                torch.cuda.memory_allocated() / 1e9, 2
+            ),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 </file>
 
 <file path="colab_setup_and_run.py">
-# Enhanced setup with multiple tunnel options
-import os, re, subprocess, textwrap, time
+"""
+Colab Setup for LTX-Video Documentary API
+Model: Lightricks/LTX-Video (LTXV-13B-0.9.7-distilled)
+Optimised for Google Colab T4 GPU (15GB VRAM)
+"""
+import os
+import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 
-# IMPORTANT: Use ZeroScope v2 for 16:9 ratio and better quality
-os.environ.setdefault("MODEL_ID", "cerspense/zeroscope_v2_576w")
+
+# ─────────────────────────── Environment ──────────────────────
+os.environ.setdefault("MODEL_ID", "Lightricks/LTX-Video")
+os.environ.setdefault("CKPT_ID", "Lightricks/LTXV-13B-0.9.7-distilled")
 os.environ.setdefault("OUTPUT_DIR", "/content/generated_videos")
 
-print("📦 Installing dependencies...")
-subprocess.run("pip -q install -r requirements_colab.txt", shell=True, check=True)
+COLAB_PORT = 8000
 
-# Install pyngrok for more reliable tunneling
-print("🔧 Installing ngrok...")
-subprocess.run("pip -q install pyngrok", shell=True, check=True)
 
-# Start FastAPI
-print("🚀 Starting FastAPI server...")
-api = subprocess.Popen("uvicorn app:app --host 0.0.0.0 --port 8000", shell=True)
-time.sleep(8)
+def run(cmd: str, check: bool = True, capture: bool = False):
+    kwargs = {"shell": True, "check": check}
+    if capture:
+        kwargs["capture_output"] = True
+        kwargs["text"] = True
+    return subprocess.run(cmd, **kwargs)
 
-# Try ngrok first (more reliable)
+
+def section(title: str):
+    print(f"\n{'='*65}")
+    print(f"  {title}")
+    print(f"{'='*65}")
+
+
+# ─────────────────────────── GPU Check ────────────────────────
+section("1/6  GPU Verification")
+result = run("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader",
+             capture=True)
+if result.returncode == 0:
+    print(f"✅ GPU: {result.stdout.strip()}")
+else:
+    print("❌ No GPU detected!")
+    print("   Go to: Runtime > Change runtime type > T4 GPU")
+    sys.exit(1)
+
+# Parse VRAM
+vram_result = run(
+    "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits",
+    capture=True
+)
 try:
-    print("🌐 Creating ngrok tunnel...")
-    from pyngrok import ngrok
-    
-    # Create tunnel
-    public_url = ngrok.connect(8000, bind_tls=True)
-    public_url = str(public_url).replace('NgrokTunnel: "', '').replace('" -> "http://127.0.0.1:8000"', '')
-    
-    print(f"✅ ngrok tunnel created: {public_url}")
-    
-except Exception as e:
-    print(f"❌ ngrok failed: {e}")
-    print("🔄 Falling back to Cloudflare...")
-    
-    # Fallback to cloudflared
-    if not Path("/usr/local/bin/cloudflared").exists():
-        print("🔧 Installing Cloudflare tunnel...")
-        subprocess.run("wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared", shell=True, check=True)
-        subprocess.run("chmod +x /usr/local/bin/cloudflared", shell=True, check=True)
+    vram_mb = int(vram_result.stdout.strip())
+    vram_gb = vram_mb / 1024
+    print(f"✅ VRAM: {vram_gb:.1f} GB")
+    if vram_gb < 12:
+        print("⚠️  Less than 12GB VRAM detected. Using memory-safe settings.")
+        os.environ["MEMORY_SAFE"] = "1"
+except Exception:
+    vram_gb = 15.0
 
-    # Start Cloudflare tunnel with retries
-    for attempt in range(3):
-        print(f"🌐 Cloudflare tunnel attempt {attempt + 1}/3...")
-        tunnel = subprocess.Popen(
-            "cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate",
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+
+# ─────────────────────────── Install ──────────────────────────
+section("2/6  Installing Dependencies")
+
+# Upgrade pip silently
+run("pip install -q --upgrade pip")
+
+# Install PyTorch first (Colab usually has it, but ensure correct version)
+print("📦 Checking PyTorch + CUDA...")
+result = run(
+    'python -c "import torch; print(torch.__version__, torch.cuda.is_available())"',
+    capture=True, check=False
+)
+print(f"   Current: {result.stdout.strip()}")
+
+# Install requirements
+print("📦 Installing requirements...")
+run("pip install -q -r requirements_colab.txt")
+
+# Verify critical imports
+print("🔍 Verifying key packages...")
+verify_imports = [
+    "import torch; print(f'  torch {torch.__version__}, CUDA={torch.cuda.is_available()}')",
+    "import diffusers; print(f'  diffusers {diffusers.__version__}')",
+    "import transformers; print(f'  transformers {transformers.__version__}')",
+    "import imageio_ffmpeg; print(f'  imageio-ffmpeg OK')",
+]
+for imp in verify_imports:
+    result = run(f'python -c "{imp}"', capture=True, check=False)
+    print(result.stdout.strip() or f"  ⚠️ {result.stderr.strip()[:60]}")
+
+
+# ─────────────────────────── Output Dir ───────────────────────
+section("3/6  Preparing Output Directory")
+out_dir = Path(os.environ["OUTPUT_DIR"])
+out_dir.mkdir(parents=True, exist_ok=True)
+print(f"✅ Output directory: {out_dir}")
+
+
+# ─────────────────────────── Start API ────────────────────────
+section("4/6  Starting FastAPI Server")
+
+# Kill any existing server on port
+run(f"fuser -k {COLAB_PORT}/tcp 2>/dev/null || true", check=False)
+time.sleep(2)
+
+env_exports = " ".join(
+    f'{k}="{v}"'
+    for k, v in os.environ.items()
+    if k in ("MODEL_ID", "CKPT_ID", "OUTPUT_DIR", "PUBLIC_BASE_URL",
+             "MEMORY_SAFE")
+)
+
+server_proc = subprocess.Popen(
+    f"uvicorn app:app --host 0.0.0.0 --port {COLAB_PORT} "
+    f"--log-level info --timeout-keep-alive 600",
+    shell=True,
+    env={**os.environ},
+)
+
+# Wait for server to be ready
+print("⏳ Waiting for server to start...")
+for i in range(30):
+    time.sleep(1)
+    check = run(
+        f"curl -s http://127.0.0.1:{COLAB_PORT}/health",
+        capture=True, check=False
+    )
+    if check.returncode == 0 and "ok" in check.stdout:
+        print(f"✅ Server ready after {i+1}s")
+        break
+else:
+    print("⚠️  Server may still be starting, proceeding anyway...")
+
+
+# ─────────────────────────── Tunnel ───────────────────────────
+section("5/6  Creating Public Tunnel")
+
+public_url = None
+
+# ── Method 1: ngrok ───────────────────────────────────────────
+try:
+    print("🔄 Trying ngrok tunnel...")
+    from pyngrok import ngrok, conf
+
+    # Optional: set auth token for longer sessions
+    ngrok_token = os.environ.get("NGROK_AUTHTOKEN", "")
+    if ngrok_token:
+        conf.get_default().auth_token = ngrok_token
+        print("   Using ngrok auth token (extended session)")
+    else:
+        print("   No NGROK_AUTHTOKEN set (free tier - may have limits)")
+
+    tunnel = ngrok.connect(COLAB_PORT, bind_tls=True)
+    public_url = str(tunnel.public_url)
+    print(f"✅ ngrok tunnel: {public_url}")
+
+except Exception as ngrok_err:
+    print(f"⚠️  ngrok failed: {ngrok_err}")
+
+    # ── Method 2: cloudflared ─────────────────────────────────
+    print("🔄 Trying Cloudflare tunnel...")
+
+    cf_bin = Path("/usr/local/bin/cloudflared")
+    if not cf_bin.exists():
+        print("   Downloading cloudflared...")
+        run(
+            "wget -q https://github.com/cloudflare/cloudflared/releases/"
+            "latest/download/cloudflared-linux-amd64 "
+            f"-O {cf_bin}",
         )
+        run(f"chmod +x {cf_bin}")
 
-        public_url = None
-        for _ in range(40):  # Reduced timeout
-            line = tunnel.stdout.readline()
-            if line:
-                print(line, end="")
-                m = re.search(r"https://[-a-zA-Z0-9.]+trycloudflare.com", line)
-                if m:
-                    public_url = m.group(0)
-                    break
-            time.sleep(1)
-        
-        if public_url:
+    cf_proc = subprocess.Popen(
+        f"{cf_bin} tunnel --url http://127.0.0.1:{COLAB_PORT} --no-autoupdate",
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    for _ in range(60):
+        line = cf_proc.stdout.readline()
+        m = re.search(r"https://[-\w]+\.trycloudflare\.com", line)
+        if m:
+            public_url = m.group(0)
+            print(f"✅ Cloudflare tunnel: {public_url}")
             break
-        else:
-            tunnel.terminate()
-            print(f"❌ Attempt {attempt + 1} failed, retrying...")
-            time.sleep(5)
-    
+        time.sleep(1)
+
     if not public_url:
-        raise RuntimeError("All tunnel methods failed. Try restarting the Colab runtime and running again.")
+        cf_proc.terminate()
+        raise RuntimeError(
+            "Both ngrok and Cloudflare tunnels failed.\n"
+            "Try: Runtime > Restart runtime, then run again."
+        )
 
 os.environ["PUBLIC_BASE_URL"] = public_url
 
-print("\n" + "="*70)
-print("✅ PRODUCTION TEXT-TO-VIDEO API IS LIVE")
-print("="*70)
-print(f"📡 Base URL: {public_url}")
-print(f"🎬 Generate endpoint: {public_url}/generate_sync")
-print(f"💚 Health check: {public_url}/health")
-print(f"🎥 Model: {os.environ['MODEL_ID']}")
-print(f"📐 Max resolution: 576×320 (16:9 aspect ratio)")
-print(f"⚡ Recommended: 24 frames, 40 steps, guidance 17.5")
-print("="*70)
-print("\n⚠️  Keep this Colab tab open while n8n generates videos\n")
 
-# Test the API
-try:
-    import requests
-    response = requests.get(f"{public_url}/health", timeout=10)
-    if response.status_code == 200:
-        print("✅ API health check passed")
-    else:
-        print(f"⚠️  API health check returned {response.status_code}")
-except Exception as e:
-    print(f"⚠️  Could not verify API health: {e}")
+# ─────────────────────────── Warmup ───────────────────────────
+section("6/6  Model Warmup (Pre-loading into VRAM)")
 
-# Keep alive
+print("⏳ Pre-loading LTX-Video model... (~3-5 minutes on first run)")
+print("   This downloads ~12GB of model weights on first run.")
+print("   Subsequent runs use cached weights (~30s).\n")
+
+warmup_result = run(
+    f'curl -s -X POST "{public_url}/warmup"',
+    capture=True, check=False
+)
+if "model_loaded" in warmup_result.stdout:
+    print(f"✅ Model loaded: {warmup_result.stdout.strip()}")
+else:
+    print("⚠️  Warmup endpoint returned unexpected response.")
+    print("   Model will load on first generation request instead.")
+    print(f"   Response: {warmup_result.stdout[:200]}")
+
+
+# ─────────────────────────── Summary ──────────────────────────
+print("\n" + "█"*65)
+print("  ✅  LTX-VIDEO DOCUMENTARY API IS LIVE")
+print("█"*65)
+print(f"\n  📡  Base URL      : {public_url}")
+print(f"  🎬  Generate sync : {public_url}/generate_sync")
+print(f"  🔄  Generate async: {public_url}/generate")
+print(f"  💚  Health check  : {public_url}/health")
+print(f"  📋  Job list      : {public_url}/jobs")
+print(f"\n  🎥  Model         : {os.environ['MODEL_ID']}")
+print(f"  ⚡  Checkpoint    : {os.environ['CKPT_ID']}")
+print(f"  🖥️   GPU VRAM      : {vram_gb:.1f} GB")
+
+print("""
+  📐  RECOMMENDED SETTINGS FOR n8n:
+  ┌─────────────────────────────────────────┐
+  │  num_frames        : 97 (4s @ 24fps)   │
+  │  num_inference_steps: 6  (distilled)   │
+  │  guidance_scale    : 1.0               │
+  │  width             : 704               │
+  │  height            : 480               │
+  │  fps               : 24                │
+  │  enhance_prompt    : true              │
+  │  n8n HTTP timeout  : 600000ms (10min)  │
+  └─────────────────────────────────────────┘
+
+  💾  IF OUT OF MEMORY - use these instead:
+  ┌─────────────────────────────────────────┐
+  │  width             : 512               │
+  │  height            : 288               │
+  │  num_frames        : 49 (2s @ 24fps)   │
+  └─────────────────────────────────────────┘
+
+  ⚠️   Keep this Colab tab ACTIVE during generation
+  ⚠️   Free Colab disconnects after ~90min idle
+""")
+print("█"*65 + "\n")
+
+# ─────────────────────────── Keep-Alive ───────────────────────
+print("🔄 Server running... (Ctrl+C to stop)\n")
+heartbeat = 0
 while True:
-    time.sleep(60)
-</file>
-
-<file path="n8n_workflow.json">
-{
-  "nodes": [
-    {
-      "parameters": {},
-      "id": "bb1b7051-fb0d-4379-af96-fd77d744bc62",
-      "name": "Manual Trigger",
-      "type": "n8n-nodes-base.manualTrigger",
-      "typeVersion": 1,
-      "position": [
-        2976,
-        2032
-      ]
-    },
-    {
-      "parameters": {
-        "documentId": {
-          "__rl": true,
-          "value": "1cI5ebsvBqGF7Gk3NxomDqMVtYsvAQ8BRomtRHiKK2Hc",
-          "mode": "list"
-        },
-        "sheetName": {
-          "__rl": true,
-          "value": 1667439052,
-          "mode": "list"
-        },
-        "options": {}
-      },
-      "id": "be19412d-fc53-4920-8a06-4bb6b118f2ac",
-      "name": "Read Prompts from Google Sheet",
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4,
-      "position": [
-        3200,
-        2032
-      ],
-      "credentials": {
-        "googleSheetsOAuth2Api": {
-          "id": "8OsKTqcQI3Rry1Uu",
-          "name": "Google Sheets account"
-        }
-      }
-    },
-    {
-      "parameters": {
-        "jsCode": "const slug = (v, fb) => String(v || fb)\n  .toLowerCase()\n  .replace(/[^a-z0-9._-]+/g, '-')\n  .replace(/-+/g, '-')\n  .replace(/^[._-]+|[._-]+$/g, '')\n  .slice(0, 80) || fb;\n\nreturn items\n  .filter(item => {\n    const j = item.json;\n    const promptText = String(j['Prompt Text'] || '').trim();\n    if (!promptText || promptText.includes('See original prompt content')) {\n      return false;\n    }\n    const status = String(j.status || '').toLowerCase();\n    return status !== 'done';\n  })\n  .map(item => {\n    const j = item.json;\n    const promptText = String(j['Prompt Text'] || '').trim();\n    const negativePrompt = String(j['Negative Prompts'] || 'low quality, worst quality, blurry, distorted, watermark, text overlay, logo, bad anatomy, deformed, disfigured, mutation, ugly, static camera, slideshow, jpeg artifacts, compression artifacts');\n    const section = String(j.Section || 'default').trim();\n    const safeFolder = slug(section, 'documentary-series');\n    const promptNum = String(j['Prompt #'] || '').trim();\n    const promptTitle = String(j['Prompt Title'] || '').trim();\n    const safePrefix = slug(\n      (promptNum ? 'prompt-' + promptNum + '-' : '') + promptTitle,\n      'clip'\n    );\n    \n    return {\n      json: {\n        row_number: j.row_number,\n        section: section,\n        prompt_title: promptTitle,\n        prompt: promptText,\n        negative_prompt: negativePrompt,\n        subfolder: safeFolder,\n        filename_prefix: safePrefix,\n        seed: undefined,\n        num_frames: 24,\n        num_inference_steps: 40,\n        guidance_scale: 17.5,\n        width: 576,\n        height: 320,\n        fps: 8\n      }\n    };\n  });"
-      },
-      "id": "050e3a2b-917c-4cb2-8fd1-7364b3ddde0d",
-      "name": "Prepare Rows",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        3424,
-        2032
-      ]
-    },
-    {
-      "parameters": {
-        "options": {}
-      },
-      "id": "814c0af2-6af6-4045-b7fd-0c958598e6a9",
-      "name": "Split In Batches",
-      "type": "n8n-nodes-base.splitInBatches",
-      "typeVersion": 3,
-      "position": [
-        3648,
-        2032
-      ]
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "https://mail-licence-amp-occurrence.trycloudflare.com/generate",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({\n  prompt: $json.prompt,\n  negative_prompt: $json.negative_prompt,\n  seed: $json.seed,\n  num_frames: $json.num_frames,\n  num_inference_steps: $json.num_inference_steps,\n  guidance_scale: $json.guidance_scale,\n  width: $json.width,\n  height: $json.height,\n  fps: $json.fps,\n  subfolder: $json.subfolder,\n  filename_prefix: $json.filename_prefix\n}) }}",
-        "options": {
-          "timeout": 30000
-        }
-      },
-      "id": "49f771cf-7ce8-4d20-9e01-81c01b2c3645",
-      "name": "Start Generation",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        3856,
-        2032
-      ]
-    },
-    {
-      "parameters": {
-        "jsCode": "return items.map(item => ({\n  json: {\n    job_id: item.json.job_id,\n    status: item.json.status || 'queued',\n    original_data: $('Prepare Rows').item.json,\n    poll_count: 0\n  }\n}));"
-      },
-      "id": "879363f5-0cc6-48ec-bc96-e35861468768",
-      "name": "Initialize Polling",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        4032,
-        2032
-      ]
-    },
-    {
-      "parameters": {
-        "amount": 20
-      },
-      "id": "cf040a35-8b3e-40b2-9c76-e9fc008dd147",
-      "name": "Wait 20 Seconds",
-      "type": "n8n-nodes-base.wait",
-      "typeVersion": 1.1,
-      "position": [
-        4208,
-        2032
-      ],
-      "webhookId": "wait-webhook"
-    },
-    {
-      "parameters": {
-        "url": "=https://mail-licence-amp-occurrence.trycloudflare.com/jobs/{{ $json.job_id }}",
-        "options": {
-          "timeout": 30000
-        }
-      },
-      "id": "bce22b49-3c66-43a6-9d34-37faaf8b8675",
-      "name": "Poll Job Status",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        4384,
-        2032
-      ]
-    },
-    {
-      "parameters": {
-        "jsCode": "return items.map(item => {\n  const pollingResponse = item.json;\n  const previousData = $('Wait 20 Seconds').item.json;\n  \n  return {\n    json: {\n      job_id: previousData.job_id,\n      original_data: previousData.original_data,\n      poll_count: (previousData.poll_count || 0) + 1,\n      status: pollingResponse.status,\n      video_url: pollingResponse.video_url,\n      file_name: pollingResponse.file_name,\n      file_path: pollingResponse.file_path,\n      seed: pollingResponse.seed,\n      generation_time: pollingResponse.generation_time,\n      error: pollingResponse.error\n    }\n  };\n});"
-      },
-      "id": "73dd29a4-2a36-4662-be2d-1fe12c1806dd",
-      "name": "Merge Poll Response",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        4560,
-        2032
-      ]
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "string": [
-            {
-              "value1": "={{ $json.status }}",
-              "value2": "completed"
-            }
-          ]
-        }
-      },
-      "id": "a9a41963-6a5d-4c43-b1cf-cb88d852cfb9",
-      "name": "Check If Completed",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 1,
-      "position": [
-        4736,
-        2032
-      ]
-    },
-    {
-      "parameters": {
-        "jsCode": "return items.map(item => {\n  const r = item.json;\n  const prepareData = r.original_data;\n  \n  if (r.status !== 'completed' || !r.video_url) {\n    throw new Error('Generation failed: ' + JSON.stringify(r));\n  }\n  \n  const file = String(r.file_name || (r.job_id + '.mp4'))\n    .replace(/[^a-zA-Z0-9._-]/g, '_');\n  const folder = String(prepareData.subfolder || 'documentary-series')\n    .replace(/[^a-zA-Z0-9._-]/g, '-');\n  const localPath = `$HOME/video/${folder}/${file}`;\n  \n  return {\n    json: {\n      ...prepareData,\n      job_id: r.job_id,\n      video_url: r.video_url,\n      safe_file: file,\n      safe_folder: folder,\n      local_path: localPath,\n      seed: r.seed,\n      generation_time: r.generation_time\n    }\n  };\n});"
-      },
-      "id": "a5b6281f-0f25-4116-a4cf-2bddc3756a17",
-      "name": "Prepare Download",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        4896,
-        1920
-      ]
-    },
-    {
-      "parameters": {
-        "command": "={{ 'mkdir -p \"$HOME/video/' + $json.safe_folder + '\" && curl -L --fail --retry 3 \"' + $json.video_url + '\" -o \"$HOME/video/' + $json.safe_folder + '/' + $json.safe_file + '\" && echo \"✅ Saved: $HOME/video/' + $json.safe_folder + '/' + $json.safe_file + ' (seed: ' + $json.seed + ', time: ' + $json.generation_time + 's)\"' }}"
-      },
-      "id": "c22b38f6-03f5-4b54-9e67-647a6f98fcd0",
-      "name": "SSH Save Video",
-      "type": "n8n-nodes-base.ssh",
-      "typeVersion": 1,
-      "position": [
-        5072,
-        1920
-      ],
-      "credentials": {
-        "sshPassword": {
-          "id": "agD4kJPh6DmOckRr",
-          "name": "SSH Password account"
-        }
-      }
-    },
-    {
-      "parameters": {
-        "jsCode": "return items.map(item => {\n  const base = $('Prepare Download').item.json;\n  return {\n    json: {\n      row_number: base.row_number,\n      status: 'done',\n      video_url: base.video_url,\n      local_path: base.local_path,\n      file_name: base.safe_file,\n      seed: base.seed,\n      generation_time: base.generation_time\n    }\n  };\n});"
-      },
-      "id": "a6bd3bb1-802a-48aa-9bb7-1c76c86afb3c",
-      "name": "Prepare Sheet Update",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        5248,
-        1920
-      ]
-    },
-    {
-      "parameters": {
-        "operation": "update",
-        "documentId": {
-          "__rl": true,
-          "value": "1cI5ebsvBqGF7Gk3NxomDqMVtYsvAQ8BRomtRHiKK2Hc",
-          "mode": "list"
-        },
-        "sheetName": {
-          "__rl": true,
-          "value": 1667439052,
-          "mode": "list"
-        },
-        "columns": {
-          "mappingMode": "defineBelow",
-          "value": {
-            "status": "={{ $json.status }}",
-            "video_url": "={{ $json.video_url }}",
-            "local_path": "={{ $json.local_path }}",
-            "file_name": "={{ $json.file_name }}"
-          },
-          "matchingColumns": [
-            "row_number"
-          ]
-        },
-        "options": {}
-      },
-      "id": "2d5df080-997b-4201-bfbe-539496fcd704",
-      "name": "Update Sheet Status",
-      "type": "n8n-nodes-base.googleSheets",
-      "typeVersion": 4,
-      "position": [
-        5424,
-        1920
-      ],
-      "credentials": {
-        "googleSheetsOAuth2Api": {
-          "id": "8OsKTqcQI3Rry1Uu",
-          "name": "Google Sheets account"
-        }
-      }
-    }
-  ],
-  "connections": {
-    "Manual Trigger": {
-      "main": [
-        [
-          {
-            "node": "Read Prompts from Google Sheet",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Read Prompts from Google Sheet": {
-      "main": [
-        [
-          {
-            "node": "Prepare Rows",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Prepare Rows": {
-      "main": [
-        [
-          {
-            "node": "Split In Batches",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Split In Batches": {
-      "main": [
-        [],
-        [
-          {
-            "node": "Start Generation",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Start Generation": {
-      "main": [
-        [
-          {
-            "node": "Initialize Polling",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Initialize Polling": {
-      "main": [
-        [
-          {
-            "node": "Wait 20 Seconds",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Wait 20 Seconds": {
-      "main": [
-        [
-          {
-            "node": "Poll Job Status",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Poll Job Status": {
-      "main": [
-        [
-          {
-            "node": "Merge Poll Response",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Merge Poll Response": {
-      "main": [
-        [
-          {
-            "node": "Check If Completed",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Check If Completed": {
-      "main": [
-        [
-          {
-            "node": "Prepare Download",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Wait 20 Seconds",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Prepare Download": {
-      "main": [
-        [
-          {
-            "node": "SSH Save Video",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "SSH Save Video": {
-      "main": [
-        [
-          {
-            "node": "Prepare Sheet Update",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Prepare Sheet Update": {
-      "main": [
-        [
-          {
-            "node": "Update Sheet Status",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Update Sheet Status": {
-      "main": [
-        [
-          {
-            "node": "Split In Batches",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    }
-  },
-  "pinData": {},
-  "meta": {
-    "templateCredsSetupCompleted": true,
-    "instanceId": "b4b3888f2b16b749440ab4ac4a27b5996372013c2346e260c8154399f21c628e"
-  }
-}
+    time.sleep(30)
+    heartbeat += 1
+    # Ping own health every 30s to prevent Colab idle timeout
+    check = run(
+        f"curl -s http://127.0.0.1:{COLAB_PORT}/health",
+        capture=True, check=False
+    )
+    if heartbeat % 4 == 0:  # Every 2 minutes
+        vram_check = run(
+            "nvidia-smi --query-gpu=memory.used,memory.free "
+            "--format=csv,noheader,nounits",
+            capture=True, check=False
+        )
+        if vram_check.returncode == 0:
+            used, free = vram_check.stdout.strip().split(",")
+            print(
+                f"  💓 Heartbeat #{heartbeat} | "
+                f"VRAM: {int(used)//1024}GB used / "
+                f"{int(free)//1024}GB free | "
+                f"API: {'✅' if 'ok' in check.stdout else '❌'}"
+            )
 </file>
 
 </files>
